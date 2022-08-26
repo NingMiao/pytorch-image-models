@@ -1,0 +1,1 @@
+python3 train.py /mnt/ssd/imagenet/ --device tpu-1
