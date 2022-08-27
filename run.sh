@@ -1,1 +1,1 @@
-python3 train.py /mnt/ssd/imagenet/ --device tpu-1
+python3 train.py /mnt/ssd/imagenet/ --device tpu-8 --experiment resnet-50-from_scratch --resume output/train/resnet-50-from_scratch/model.ckpt

@@ -185,7 +185,6 @@ def create_loader(
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
         num_workers=1,
-        distributed=False,
         crop_pct=None,
         collate_fn=None,
         pin_memory=False,
@@ -194,6 +193,8 @@ def create_loader(
         use_multi_epochs_loader=False,
         persistent_workers=True,
         worker_seeding='all',
+        num_replicas=0,
+        rank=0,
 ):
     re_num_splits = 0
     if re_split:
@@ -223,18 +224,6 @@ def create_loader(
     )
 
     sampler = None
-    if distributed and not isinstance(dataset, torch.utils.data.IterableDataset):
-        if is_training:
-            if num_aug_repeats:
-                sampler = RepeatAugSampler(dataset, num_repeats=num_aug_repeats)
-            else:
-                sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        else:
-            # This will add extra duplicate entries to result in equal num
-            # of samples per-process, will slightly alter validation results
-            sampler = OrderedDistributedSampler(dataset)
-    else:
-        assert num_aug_repeats == 0, "RepeatAugment not currently supported in non-distributed or IterableDataset use"
 
     if collate_fn is None:
         collate_fn = fast_collate if use_prefetcher else torch.utils.data.dataloader.default_collate
@@ -254,6 +243,16 @@ def create_loader(
         worker_init_fn=partial(_worker_init, worker_seeding=worker_seeding),
         persistent_workers=persistent_workers
     )
+    
+    if num_replicas>0:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+                           dataset,
+                           num_replicas=num_replicas,
+                           rank=rank,
+                           shuffle=is_training)
+        loader_args['sampler']=sampler
+        loader_args['shuffle']=False
+    
     try:
         loader = loader_class(dataset, **loader_args)
     except TypeError as e:
