@@ -526,9 +526,9 @@ def run_wrapper(_, args, args_text, log_fn):
     try:
         eval_acc_old=0.0
         for epoch in range(start_epoch, num_epochs):
-            #?train_metrics = train_one_epoch(
-            #?    epoch, model, loader_train, optimizer, train_loss_fn, args,
-            #?    lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device)
+            train_metrics = train_one_epoch(
+                epoch, model, loader_train, optimizer, train_loss_fn, args,
+                lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device)
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device)
             
