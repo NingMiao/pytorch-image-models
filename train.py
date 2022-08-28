@@ -39,7 +39,6 @@ from timm.utils import ApexScaler, NativeScaler
 
 
 torch.backends.cudnn.benchmark = True
-_logger = logging.getLogger('train')
 
 # The first arg parser parses out only the --config argument, this argument is used to
 # load a yaml file containing key-values that override the defaults for the main parser below
@@ -277,6 +276,15 @@ group = parser.add_argument_group('Device')
 group.add_argument('--device', type=str, default='cpu',
                     help='cpu/cuda/tpu-1/tp')
 
+# Learnable Invariance
+group = parser.add_argument_group('Li')
+group.add_argument('-Li_config_path', type=str, default='', help='')
+group.add_argument('-target_entropy', type=float, default=3.0, help='log(17)=2.83')
+group.add_argument('--resume_Li', default='', type=str, metavar='PATH',
+                    help='Resume full model and optimizer state from checkpoint (default: none)')
+group.add_argument('-Li_save_path', type=str, default='', help='')
+group.add_argument('-entropy_weights', type=float, default=0.0, help='')
+
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -288,15 +296,27 @@ def _parse_args():
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
     args = parser.parse_args(remaining)
-
+    
+    if args.Li_config_path:
+        Li_configs=yaml.safe_load(open(args.Li_config_path,'r'))
+        if args.entropy_weights:
+            Li_configs['entropy_weights']=args.entropy_weights  
+        import sys
+        sys.path.insert(0, '../InstaAug/')
+        global learnable_invariance
+        from InstaAug_module import learnable_invariance
+        
+    else:
+        Li_configs={'li_flag': False}
+    
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-    return args, args_text
+    return args, args_text, Li_configs
 
 
 def main():
     utils.setup_default_logging()
-    args, args_text = _parse_args()
+    args, args_text, Li_configs = _parse_args()
     
     if args.device.startswith('tpu'):
         args.tpu_core_num=int(args.device[4:])
@@ -314,21 +334,21 @@ def main():
             xm.master_print(string)
             
         
-        xmp.spawn(run_wrapper, args=(args, args_text, log_fn), nprocs=args.tpu_core_num, start_method='fork')
+        xmp.spawn(run_wrapper, args=(args, args_text, log_fn, Li_configs), nprocs=args.tpu_core_num, start_method='fork')
     else:
-        run_wrapper('', args, args_text, log_fn=print)
+        run_wrapper('', args, args_text, print, Li_configs)
     
 def reduce_fn(vals):
     return sum(vals) / len(vals)
     
-def run_wrapper(_, args, args_text, log_fn):
+def run_wrapper(_, args, args_text, log_fn, Li_configs):
     
     if args.log_wandb and xm.is_master_ordinal():
         wandb.init(project=args.experiment, config=args)
 
     torch.manual_seed(124)
     
-
+    #Initialize model
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -350,19 +370,35 @@ def run_wrapper(_, args, args_text, log_fn):
     else:
         device=args.device
 
-    log_fn(
-            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
-
-    data_config = resolve_data_config(vars(args), model=model)#?verbose
+    log_fn(f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+    
+    #Initialize Li net
+    if Li_configs['li_flag']:
+        Li=learnable_invariance(Li_configs, device='cpu')  
+        if args.tpu_core_num>0:
+            Li = xmp.MpModelWrapper(Li)
+            Li=Li.to(device)
+            log_fn(f'Li net created, param count:{sum([m.numel() for m in Li.parameters()])}')
+    else:
+        Li=None
+        log_fn('No Li net')
+    
+    
+    
+    data_config = resolve_data_config(vars(args), model=model)
 
     # setup augmentation batch splits for contrastive loss
     num_aug_splits = 0
     if args.aug_splits > 0:
         assert args.aug_splits > 1, 'A split of 1 makes no sense'
         num_aug_splits = args.aug_splits
-
+    
+    #Create optimizer
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
-
+    if Li_configs['li_flag']:
+        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+    
+    
     # optionally resume from a checkpoint
     resume_epoch = None
     if args.resume:
@@ -375,8 +411,13 @@ def run_wrapper(_, args, args_text, log_fn):
         if 'optimizer' in saved_dict and not args.no_resume_opt:
             optimizer.load_state_dict(saved_dict['optimizer'])
         model.to(device)
-        log_fn('resume finished! Epoch: {}'.format(resume_epoch))
-
+        log_fn('resume model finished! Epoch: {}'.format(resume_epoch))
+    if args.resume_Li and Li_configs['li_flag']:
+        Li.to('cpu')
+        saved_dict=torch.load(args.resume_Li)
+        Li.load_state_dict(saved_dict)
+        Li.to(device)
+        log_fn('resume Li finished! Epoch: {}'.format(resume_epoch))
 
 
 
@@ -391,8 +432,18 @@ def run_wrapper(_, args, args_text, log_fn):
     if lr_scheduler is not None and start_epoch > 0:
         lr_scheduler.step(start_epoch)
 
-    _logger.info('Scheduled epochs: {}'.format(num_epochs))
-
+    log_fn('Scheduled epochs: {}'.format(num_epochs))
+    
+    if Li_configs['li_flag']:
+        lr_scheduler_Li, _ = create_scheduler(args, optimizer)
+        if lr_scheduler_Li is not None and start_epoch > 0:
+            lr_scheduler_Li.step(start_epoch)
+        Li.optimizer=optimizer_Li
+        Li.scheduler=lr_scheduler_Li
+        Li.target_entropy=args.target_entropy
+        Li.start_epoch=start_epoch
+    
+    
     # create the train and eval datasets
     dataset_train = create_dataset(
         args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
@@ -528,9 +579,9 @@ def run_wrapper(_, args, args_text, log_fn):
         for epoch in range(start_epoch, num_epochs):
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device)
+                lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs)
 
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device)
+            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
             
             if lr_scheduler is not None:
                 # step LR for next epoch
@@ -567,7 +618,7 @@ def run_wrapper(_, args, args_text, log_fn):
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, output_dir=None,
-        loss_scaler=None, mixup_fn=None, device=None, log_fn=print):
+        loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}):
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if mixup_fn is not None:
@@ -577,6 +628,7 @@ def train_one_epoch(
     batch_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    entropy_m = utils.AverageMeter()
 
     model.train()
     
@@ -596,14 +648,51 @@ def train_one_epoch(
             input, target = mixup_fn(input, target)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
-
-        output = model(input)
-        loss = loss_fn(output, target)
-
-        losses_m.update(loss.item(), input.size(0))
-
-        optimizer.zero_grad()
-        if True:
+        
+        
+        if Li_configs['li_flag']:
+            optimizer_Li=Li.optimizer
+            train_scheduler_Li=Li.scheduler
+            input_Li, logprob, entropy_every=Li(input)
+                        
+            output = model(input_Li)
+            loss_predictor = loss_fn(output, target)
+            losses_m.update(loss_predictor.item(), input.size(0))
+            
+            loss_Li_pre=(loss_predictor.detach()*logprob).mean()+loss_predictor.mean()
+            entropy=entropy_every.mean(dim=0)
+            entropy_m.update(entropy.mean().item(), input.size(0))
+            
+            if epoch==Li.start_epoch:
+                Li.start_entropy=entropy.mean().detach()
+                Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
+            
+            r=min(1, (epoch-Li.start_epoch)/Li_configs['entropy_increase_period'])
+            mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
+            loss=loss_Li_pre+(entropy.mean()-mid_target_entropy)**2*0.3#!#!#!#!
+            
+            optimizer.zero_grad()
+            optimizer_Li.zero_grad()
+            
+            loss.backward()
+            
+            if args.clip_grad is not None:
+                utils.dispatch_clip_grad(
+                    model_parameters(model, exclude_head='agc' in args.clip_mode),
+                    value=args.clip_grad, mode=args.clip_mode)
+            
+            if args.tpu_core_num>0:
+                xm.optimizer_step(optimizer)
+                xm.optimizer_step(optimizer_Li)
+            else:
+                optimizer.step()
+                optimizer_Li.step()
+            
+        else:        
+            output = model(input)
+            loss = loss_fn(output, target)
+            losses_m.update(loss.item(), input.size(0))
+            optimizer.zero_grad()
             loss.backward(create_graph=second_order)
             if args.clip_grad is not None:
                 utils.dispatch_clip_grad(
@@ -620,9 +709,8 @@ def train_one_epoch(
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
-
-            if xm.is_master_ordinal():
-                string='Master: Train: {} [{:>4d}/{} ({:>3.0f}%)], Loss: {loss.val:#.4g} ({loss.avg:#.3g}), Time: {batch_time.val:.3f}s, {rate:>7.2f}/s, ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s), LR: {lr:.3e}, Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
+            
+            string='Master: Train: {} [{:>4d}/{} ({:>3.0f}%)], Loss: {loss.val:#.4g} ({loss.avg:#.3g}), Time: {batch_time.val:.3f}s, {rate:>7.2f}/s, ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s), LR: {lr:.3e}, Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                         epoch,
                         batch_idx, len(loader),
                         100. * batch_idx / last_idx,
@@ -632,23 +720,30 @@ def train_one_epoch(
                         rate_avg=input.size(0) * 1 / batch_time_m.avg,
                         lr=lr,
                         data_time=data_time_m)
+            if Li_configs['li_flag']:
+                string+=', entropy:{}'.format(entropy_m.avg)
+            
+            if not args.device.startswith('tpu') or xm.is_master_ordinal():
                 log_fn(string)
 
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
+        if Li.scheduler is not None:
+            Li.scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
 
     return OrderedDict([('loss', losses_m.avg)])
 
 
-def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=print):
+def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=print, Li=None, Li_configs={}):
     batch_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
     top1_m = utils.AverageMeter()
     top5_m = utils.AverageMeter()
-
+    entropy_m = utils.AverageMeter()
+    
     model.eval()
 
     end = time.time()
@@ -666,15 +761,32 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
             
-            output = model(input)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
+            
+            if Li_configs['li_flag'] and Li_configs['test_time_aug']:
+                n_copies=Li_configs['test_copies']
+                input_Li, logprob, entropy_every=Li(input, n_copies=n_copies)
+                entropy_m.update(entropy_every, entropy_every.shape[0])
+                
+                output = model(input_Li) 
+                if isinstance(output, (tuple, list)):
+                    output = output[0]
+                    
+                bs=input.shape[0]
+                logit=F.log_softmax(output)
+                logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
+                logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
+                output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
+            
+            else:
+                output = model(input)
+                if isinstance(output, (tuple, list)):
+                    output = output[0]
 
-            # augmentation reduction
-            reduce_factor = args.tta
-            if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0:target.size(0):reduce_factor]
+                # augmentation reduction
+                reduce_factor = args.tta
+                if reduce_factor > 1:
+                    output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
+                    target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
@@ -688,18 +800,11 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             batch_time_m.update(time.time() - end)
             end = time.time()
             
-            #if (last_batch or batch_idx % args.log_interval == 0):
-            #    log_name = 'Test' + log_suffix
-            #    _logger.info(
-            #        '{0}: [{1:>4d}/{2}]  '
-            #        'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-            #        'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-            #        'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-            #        'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-            #            log_name, batch_idx, last_idx, batch_time=batch_time_m,
-            #            loss=losses_m, top1=top1_m, top5=top5_m))
+    metric=[('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)]
+    if Li_configs['li_flag'] and Li_configs['test_time_aug']
+        metric.extend([('entropy', entropy_m.avg)])
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    metrics = OrderedDict(metrics)
 
     return metrics
 
