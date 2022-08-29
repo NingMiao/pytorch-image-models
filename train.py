@@ -27,6 +27,7 @@ import torch.nn as nn
 import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
+import torch.optim as optim
 
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
@@ -280,11 +281,16 @@ group.add_argument('--device', type=str, default='cpu',
 group = parser.add_argument_group('Li')
 group.add_argument('-Li_config_path', type=str, default='', help='')
 group.add_argument('-target_entropy', type=float, default=3.0, help='log(17)=2.83')
-group.add_argument('--resume_Li', default='', type=str, metavar='PATH',
+group.add_argument('-resume_Li', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 group.add_argument('-Li_save_path', type=str, default='', help='')
 group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 
+group.add_argument('-eval_only', action='store_true', default=False,
+                    help='') 
+group.add_argument('-save_every', type=int, default=10,
+                    help='') 
+                   
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -374,8 +380,8 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     
     #Initialize Li net
     if Li_configs['li_flag']:
-        Li=learnable_invariance(Li_configs, device='cpu')  
-        if args.tpu_core_num>0:
+        Li=learnable_invariance(Li_configs, device=device)  
+        if args.device.startswith('tpu'):
             Li = xmp.MpModelWrapper(Li)
             Li=Li.to(device)
             log_fn(f'Li net created, param count:{sum([m.numel() for m in Li.parameters()])}')
@@ -435,7 +441,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     log_fn('Scheduled epochs: {}'.format(num_epochs))
     
     if Li_configs['li_flag']:
-        lr_scheduler_Li, _ = create_scheduler(args, optimizer)
+        lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
         if lr_scheduler_Li is not None and start_epoch > 0:
             lr_scheduler_Li.step(start_epoch)
         Li.optimizer=optimizer_Li
@@ -577,10 +583,12 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     try:
         eval_acc_old=0.0
         for epoch in range(start_epoch, num_epochs):
-            train_metrics = train_one_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs)
-
+            if not args.eval_only:
+                train_metrics = train_one_epoch(
+                    epoch, model, loader_train, optimizer, train_loss_fn, args,
+                    lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs)
+            else:
+                train_metrics={'loss':0.0}
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
             
             if lr_scheduler is not None:
@@ -601,11 +609,11 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 log_fn(string)
                 log_fn('-------------------------------------')
 
-            if eval_metrics['top1']>eval_acc_old:
+            if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0:
                 eval_acc_old=eval_metrics['top1']
                 if not (args.device.startswith('tpu') and not xm.is_master_ordinal()):
                     state_dict={'epoch':epoch, 'model':model.to('cpu').state_dict(), 'optimizer':optimizer.state_dict(), 'acc': eval_metrics['top1']}
-                    torch.save(state_dict, os.path.join(output_dir, 'model.ckpt'))
+                    torch.save(state_dict, os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
                     model.to(device)
     except KeyboardInterrupt:
         pass
@@ -665,7 +673,8 @@ def train_one_epoch(
             
             if epoch==Li.start_epoch:
                 Li.start_entropy=entropy.mean().detach()
-                Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
+                if args.device.startswith('tpu'):
+                    Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
             
             r=min(1, (epoch-Li.start_epoch)/Li_configs['entropy_increase_period'])
             mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
@@ -681,7 +690,7 @@ def train_one_epoch(
                     model_parameters(model, exclude_head='agc' in args.clip_mode),
                     value=args.clip_grad, mode=args.clip_mode)
             
-            if args.tpu_core_num>0:
+            if args.device.startswith('tpu'):
                 xm.optimizer_step(optimizer)
                 xm.optimizer_step(optimizer_Li)
             else:
@@ -729,7 +738,7 @@ def train_one_epoch(
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
-        if Li.scheduler is not None:
+        if Li_configs['li_flag'] and Li.scheduler is not None:
             Li.scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
@@ -801,10 +810,10 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             end = time.time()
             
     metric=[('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)]
-    if Li_configs['li_flag'] and Li_configs['test_time_aug']
+    if Li_configs['li_flag'] and Li_configs['test_time_aug']:
         metric.extend([('entropy', entropy_m.avg)])
 
-    metrics = OrderedDict(metrics)
+    metrics = OrderedDict(metric)
 
     return metrics
 
