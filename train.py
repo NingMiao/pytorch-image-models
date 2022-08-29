@@ -609,7 +609,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 log_fn(string)
                 log_fn('-------------------------------------')
 
-            if eval_metrics['top1']>eval_acc_old and (epoch-start_epoch)%args.save_every==0:
+            if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0:
                 eval_acc_old=eval_metrics['top1']
                 if not (args.device.startswith('tpu') and not xm.is_master_ordinal()):
                     state_dict={'epoch':epoch, 'model':model.to('cpu').state_dict(), 'optimizer':optimizer.state_dict(), 'acc': eval_metrics['top1']}
