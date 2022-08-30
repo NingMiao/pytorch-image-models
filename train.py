@@ -28,6 +28,7 @@ import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 import torch.optim as optim
+import torch.nn.functional as F
 
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
@@ -416,7 +417,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         if 'epoch' in saved_dict:
             resume_epoch=saved_dict['epoch']            
         model.load_state_dict(saved_dict['model'])
-        if 'optimizer' in saved_dict and not args.no_resume_opt:
+        if 'optimizer' in saved_dict and not args.no_resume_opt: #Not support it now
             optimizer.load_state_dict(saved_dict['optimizer'])
         model.to(device)
         log_fn('resume model finished! Epoch: {}'.format(resume_epoch))
@@ -614,7 +615,8 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
             if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0:
                 eval_acc_old=eval_metrics['top1']
                 if not (args.device.startswith('tpu') and not xm.is_master_ordinal()):
-                    state_dict={'epoch':epoch, 'model':model.to('cpu').state_dict(), 'optimizer':optimizer.state_dict(), 'acc': eval_metrics['top1']}
+                    model.to('cpu')
+                    state_dict={'epoch':epoch, 'model':model.state_dict(), 'acc': eval_metrics['top1']}
                     torch.save(state_dict, os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
                     model.to(device)
                     
@@ -783,14 +785,14 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                 n_copies=Li_configs['test_copies']
                 input_Li, logprob, entropy_every=Li(input, n_copies=n_copies)
-                entropy_m.update(entropy_every, entropy_every.shape[0])
+                entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
                 
                 output = model(input_Li) 
                 if isinstance(output, (tuple, list)):
                     output = output[0]
                     
                 bs=input.shape[0]
-                logit=F.log_softmax(output)
+                logit=F.log_softmax(output, dim=-1)
                 logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
                 logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
                 output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
