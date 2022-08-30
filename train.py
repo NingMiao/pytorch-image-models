@@ -285,6 +285,8 @@ group.add_argument('-resume_Li', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 group.add_argument('-Li_save_path', type=str, default='', help='')
 group.add_argument('-entropy_weights', type=float, default=0.0, help='')
+group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
+
 
 group.add_argument('-eval_only', action='store_true', default=False,
                     help='') 
@@ -421,7 +423,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     if args.resume_Li and Li_configs['li_flag']:
         Li.to('cpu')
         saved_dict=torch.load(args.resume_Li)
-        Li.load_state_dict(saved_dict)
+        Li.augmentation.get_param.conv.load_state_dict(saved_dict)
         Li.to(device)
         log_fn('resume Li finished! Epoch: {}'.format(resume_epoch))
 
@@ -615,6 +617,13 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                     state_dict={'epoch':epoch, 'model':model.to('cpu').state_dict(), 'optimizer':optimizer.state_dict(), 'acc': eval_metrics['top1']}
                     torch.save(state_dict, os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
                     model.to(device)
+                    
+                    if Li_configs['li_flag']:
+                        Li.to('cpu')
+                        torch.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
+                        Li.to(device)
+                    
+                    
     except KeyboardInterrupt:
         pass
     if best_metric is not None:
@@ -678,7 +687,7 @@ def train_one_epoch(
             
             r=min(1, (epoch-Li.start_epoch)/Li_configs['entropy_increase_period'])
             mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
-            loss=loss_Li_pre+(entropy.mean()-mid_target_entropy)**2*0.3#!#!#!#!
+            loss=loss_Li_pre+(entropy.mean()-mid_target_entropy)**2*args.entropy_parameter#!#!#!#!
             
             optimizer.zero_grad()
             optimizer_Li.zero_grad()
