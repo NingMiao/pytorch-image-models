@@ -591,15 +591,19 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                     epoch, model, loader_train, optimizer, train_loss_fn, args,
                     lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs)
             else:
-                train_metrics={'loss':0.0}
+                train_metrics={'loss':0.0, 'entropy':0.0}
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
             
             if lr_scheduler is not None:
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                if Li_configs['li_flag']:
+                    lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
+                    
             
             if args.device.startswith('tpu'):
-                train_metrics['loss']=xm.mesh_reduce('train_loss', train_metrics['loss'], reduce_fn)
+                for key in train_metrics:
+                    train_metrics[key]=xm.mesh_reduce('train'+key, train_metrics[key], reduce_fn)
                 for key in eval_metrics:
                     eval_metrics[key]=xm.mesh_reduce('eval'+key, eval_metrics[key], reduce_fn)
                 
@@ -609,10 +613,14 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
                 string='epoch:{}, train_loss:{}, eval_loss:{}, eval_top_1:{}'.format(epoch, train_metrics['loss'], eval_metrics['loss'], eval_metrics['top1'])
+                if Li_configs['li_flag']:
+                    string+='train_entropy:{}'.format( train_metrics['entropy'])
+                    if Li_configs['test_time_aug']:
+                        string+=' eval_entropy:{}'.format(eval_metrics['entropy'])
                 log_fn(string)
                 log_fn('-------------------------------------')
 
-            if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0:
+            if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0 or epoch==args.epochs-1:
                 eval_acc_old=eval_metrics['top1']
                 if not (args.device.startswith('tpu') and not xm.is_master_ordinal()):
                     model.to('cpu')
@@ -682,13 +690,14 @@ def train_one_epoch(
             entropy=entropy_every.mean(dim=0)
             entropy_m.update(entropy.mean().item(), input.size(0))
             
-            if epoch==Li.start_epoch:
+            if epoch==Li.start_epoch and batch_idx==0:
                 Li.start_entropy=entropy.mean().detach()
                 if args.device.startswith('tpu'):
                     Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
             
-            r=min(1, (epoch-Li.start_epoch)/Li_configs['entropy_increase_period'])
+            r=min(1, (epoch+1-Li.start_epoch)/Li_configs['entropy_increase_period'])
             mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
+            
             loss=loss_Li_pre+(entropy.mean()-mid_target_entropy)**2*args.entropy_parameter#!#!#!#!
             
             optimizer.zero_grad()
@@ -741,7 +750,7 @@ def train_one_epoch(
                         lr=lr,
                         data_time=data_time_m)
             if Li_configs['li_flag']:
-                string+=', entropy:{}'.format(entropy_m.avg)
+                string+=', entropy:{}, target_entropy:{}, Li_lr:{}'.format(entropy_m.avg, mid_target_entropy, optimizer_Li.param_groups[0]['lr'])
             
             if not args.device.startswith('tpu') or xm.is_master_ordinal():
                 log_fn(string)
@@ -753,8 +762,11 @@ def train_one_epoch(
             Li.scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
-
-    return OrderedDict([('loss', losses_m.avg)])
+    
+    metric=[('loss', losses_m.avg)]
+    if Li_configs['li_flag']:
+        metric.extend([('entropy', entropy_m.avg)])
+    return OrderedDict(metric)
 
 
 def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=print, Li=None, Li_configs={}):
