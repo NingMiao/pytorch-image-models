@@ -401,24 +401,14 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     if args.aug_splits > 0:
         assert args.aug_splits > 1, 'A split of 1 makes no sense'
         num_aug_splits = args.aug_splits
-    
-    #Create optimizer
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
-    if Li_configs['li_flag']:
-        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
-    
+      
     
     # optionally resume from a checkpoint
     resume_epoch = None
     if args.resume:
         model.to('cpu')
-        resume_epoch=0
         saved_dict=torch.load(args.resume)
-        if 'epoch' in saved_dict:
-            resume_epoch=saved_dict['epoch']            
-        model.load_state_dict(saved_dict['model'])
-        if 'optimizer' in saved_dict and not args.no_resume_opt: #Not support it now
-            optimizer.load_state_dict(saved_dict['optimizer'])
+        model.load_state_dict(saved_dict)
         model.to(device)
         log_fn('resume model finished! Epoch: {}'.format(resume_epoch))
     if args.resume_Li and Li_configs['li_flag']:
@@ -428,7 +418,10 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         Li.to(device)
         log_fn('resume Li finished! Epoch: {}'.format(resume_epoch))
 
-
+    #Create optimizer
+    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    if Li_configs['li_flag']:
+        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -622,16 +615,21 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
 
             if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0 or epoch==args.epochs-1:
                 eval_acc_old=eval_metrics['top1']
-                if not (args.device.startswith('tpu') and not xm.is_master_ordinal()):
+                if not args.device.startswith('tpu'):
                     model.to('cpu')
-                    state_dict={'epoch':epoch, 'model':model.state_dict(), 'acc': eval_metrics['top1']}
-                    torch.save(state_dict, os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
+                    torch.save(model.state_dict(), os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
                     model.to(device)
-                    
                     if Li_configs['li_flag']:
                         Li.to('cpu')
                         torch.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
                         Li.to(device)
+                    
+                else:
+                    xm.save(model.state_dict(), os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
+                    if Li_configs['li_flag']:
+                        xm.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
+                    
+                    
                     
                     
     except KeyboardInterrupt:
