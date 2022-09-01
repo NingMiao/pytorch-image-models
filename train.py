@@ -287,6 +287,7 @@ group.add_argument('-resume_Li', default='', type=str, metavar='PATH',
 group.add_argument('-Li_save_path', type=str, default='', help='')
 group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
+group.add_argument('-Li_lr', type=float, default=0.0, help='')
 
 
 group.add_argument('-eval_only', action='store_true', default=False,
@@ -314,6 +315,8 @@ def _parse_args():
         sys.path.insert(0, '../InstaAug/')
         global learnable_invariance
         from InstaAug_module import learnable_invariance
+        if args.Li_lr>0.0:
+            Li_configs['lr']=args.Li_lr
         
     else:
         Li_configs={'li_flag': False}
@@ -562,7 +565,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     best_epoch = None
     saver = None
     output_dir = None
-    if args.device in ['cpu', 'cuda'] or xm.is_master_ordinal():
+    if True:
         if args.experiment:
             exp_name = args.experiment
         else:
@@ -573,6 +576,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
             ])
         output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
+    if args.device in ['cpu', 'cuda'] or xm.is_master_ordinal():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
@@ -760,7 +764,7 @@ def train_one_epoch(
             Li.scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
-    
+                
     metric=[('loss', losses_m.avg)]
     if Li_configs['li_flag']:
         metric.extend([('entropy', entropy_m.avg)])
