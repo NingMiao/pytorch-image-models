@@ -39,6 +39,7 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 
+import numpy as np
 
 torch.backends.cudnn.benchmark = True
 
@@ -789,6 +790,9 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     last_idx = len(loader) - 1
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
+            
+            #np.save('output/target.npy', target.detach().cpu())#@
+            
             last_batch = batch_idx == last_idx
             if args.device=='cuda':
                 input, target = input.cuda(), target.cuda()
@@ -799,6 +803,8 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                 n_copies=Li_configs['test_copies']
                 input_Li, logprob, entropy_every=Li(input, n_copies=n_copies)
+                #np.save('output/logprob.npy', logprob.detach().cpu())#@
+                #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
                 entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
                 
                 output = model(input_Li) 
@@ -808,9 +814,12 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 bs=input.shape[0]
                 logit=F.log_softmax(output, dim=-1)
                 logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
+                #np.save('output/logit.npy', logit.detach().cpu())#@
                 logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
                 output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
-            
+                #print('finish saving!')#@
+                #print(haha)#@
+                
             else:
                 output = model(input)
                 if isinstance(output, (tuple, list)):
