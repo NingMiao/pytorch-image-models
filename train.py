@@ -289,6 +289,8 @@ group.add_argument('-Li_save_path', type=str, default='', help='')
 group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
 group.add_argument('-Li_lr', type=float, default=0.0, help='')
+group.add_argument('-Li_loss', type=str, default='crossentropy', help='[crossentropy, accuracy]')
+
 
 
 group.add_argument('-eval_only', action='store_true', default=False,
@@ -689,7 +691,12 @@ def train_one_epoch(
             loss_predictor = loss_fn(output, target)
             losses_m.update(loss_predictor.item(), input.size(0))
             
-            loss_Li_pre=(loss_predictor.detach()*logprob).mean()+loss_predictor.mean()
+            if args.Li_loss=='crossentropy':
+                loss_Li=loss_predictor.detach()
+            elif args.Li_loss=='accuracy':
+                loss_Li=-output.argmax(axis=-1)==target
+            
+            loss_Li_pre=(loss_Li*logprob).mean()+loss_predictor.mean()
             entropy=entropy_every.mean(dim=0)
             entropy_m.update(entropy.mean().item(), input.size(0))
             
@@ -791,7 +798,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
             
-            #np.save('output/target.npy', target.detach().cpu())#@
+            #np.save('output/sample/target_'+str(batch_idx)+'.npy', target.detach().cpu())#@
             
             last_batch = batch_idx == last_idx
             if args.device=='cuda':
@@ -803,7 +810,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                 n_copies=Li_configs['test_copies']
                 input_Li, logprob, entropy_every=Li(input, n_copies=n_copies)
-                #np.save('output/logprob.npy', logprob.detach().cpu())#@
+                #np.save('output/sample/logprob_'+str(batch_idx)+'.npy', logprob.detach().cpu())#@
                 #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
                 entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
                 
@@ -814,7 +821,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 bs=input.shape[0]
                 logit=F.log_softmax(output, dim=-1)
                 logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
-                #np.save('output/logit.npy', logit.detach().cpu())#@
+                #np.save('output/sample/logit_'+str(batch_idx)+'.npy', logit.detach().cpu())#@
                 logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
                 output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
                 #print('finish saving!')#@
