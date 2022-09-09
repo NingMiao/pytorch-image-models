@@ -443,7 +443,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     elif resume_epoch is not None:
         start_epoch = resume_epoch
     if lr_scheduler is not None and start_epoch > 0:
-        #?lr_scheduler.step(start_epoch)
+        lr_scheduler.step(start_epoch)
         pass
 
     log_fn('Scheduled epochs: {}'.format(num_epochs))
@@ -451,7 +451,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     if Li_configs['li_flag']:
         lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
         if lr_scheduler_Li is not None and start_epoch > 0:
-            #?lr_scheduler_Li.step(start_epoch)
+            lr_scheduler_Li.step(start_epoch)
             pass
         Li.optimizer=optimizer_Li
         Li.scheduler=lr_scheduler_Li
@@ -614,10 +614,10 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
             
             if lr_scheduler is not None:
                 # step LR for next epoch
-                #?lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
                 pass
                 if Li_configs['li_flag']:
-                    #?lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
+                    lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
                     pass
                     
             
