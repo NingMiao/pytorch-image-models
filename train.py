@@ -31,7 +31,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from timm import utils
-from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
+from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset, DebugDataset
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, \
     LabelSmoothingCrossEntropy
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, convert_splitbn_model, convert_sync_batchnorm, model_parameters
@@ -297,6 +297,12 @@ group.add_argument('-eval_only', action='store_true', default=False,
                     help='') 
 group.add_argument('-save_every', type=int, default=10,
                     help='') 
+group.add_argument('-train_Li_only', action='store_true', default=False,
+                    help='') 
+group.add_argument('-batch_amount', type=int, default=0,
+                    help='for debug') 
+group.add_argument('-train_only', action='store_true', default=False,
+                    help='') 
                    
 def _parse_args():
     # Do we have a config file to parse?
@@ -318,8 +324,7 @@ def _parse_args():
         sys.path.insert(0, '../InstaAug/')
         global learnable_invariance
         from InstaAug_module import learnable_invariance
-        if args.Li_lr>0.0:
-            Li_configs['lr']=args.Li_lr
+        Li_configs['lr']=args.Li_lr
         
     else:
         Li_configs={'li_flag': False}
@@ -438,14 +443,16 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     elif resume_epoch is not None:
         start_epoch = resume_epoch
     if lr_scheduler is not None and start_epoch > 0:
-        lr_scheduler.step(start_epoch)
+        #?lr_scheduler.step(start_epoch)
+        pass
 
     log_fn('Scheduled epochs: {}'.format(num_epochs))
     
     if Li_configs['li_flag']:
         lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
         if lr_scheduler_Li is not None and start_epoch > 0:
-            lr_scheduler_Li.step(start_epoch)
+            #?lr_scheduler_Li.step(start_epoch)
+            pass
         Li.optimizer=optimizer_Li
         Li.scheduler=lr_scheduler_Li
         Li.target_entropy=args.target_entropy
@@ -459,6 +466,10 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         download=args.dataset_download,
         batch_size=args.batch_size,
         repeats=args.epoch_repeats)
+    if args.batch_amount>0:
+        dataset_train=DebugDataset(dataset_train, int(args.batch_amount*args.batch_size))
+    
+    
     dataset_eval = create_dataset(
         args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
         class_map=args.class_map,
@@ -585,20 +596,29 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
 
     try:
         eval_acc_old=0.0
+        
+        ave_loss_memory=[]
+        
         for epoch in range(start_epoch, num_epochs):
             if not args.eval_only:
+                
                 train_metrics = train_one_epoch(
                     epoch, model, loader_train, optimizer, train_loss_fn, args,
-                    lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs)
+                    lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs, ave_loss_memory=ave_loss_memory)
             else:
-                train_metrics={'loss':0.0, 'entropy':0.0}
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
+                train_metrics={'loss':0.0, 'entropy':0.0, 'KL':0.0}
+            if not args.train_only:
+                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
+            else:
+                eval_metrics={'loss':0.0, 'entropy':0.0, 'top1':0.0, 'KL':0.0}
             
             if lr_scheduler is not None:
                 # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                #?lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                pass
                 if Li_configs['li_flag']:
-                    lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
+                    #?lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
+                    pass
                     
             
             if args.device.startswith('tpu'):
@@ -612,11 +632,13 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 utils.update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
-                string='epoch:{}, train_loss:{}, eval_loss:{}, eval_top_1:{}'.format(epoch, train_metrics['loss'], eval_metrics['loss'], eval_metrics['top1'])
+                string='epoch:{}, train_loss:{}, eval_loss:{}, eval_top_1:{},'.format(epoch, train_metrics['loss'], eval_metrics['loss'], eval_metrics['top1'])
                 if Li_configs['li_flag']:
-                    string+='train_entropy:{}'.format( train_metrics['entropy'])
+                    string+=' train_entropy:{},'.format( train_metrics['entropy'])
+                    string+=' train_KL:{},'.format( train_metrics['KL'])
                     if Li_configs['test_time_aug']:
-                        string+=' eval_entropy:{}'.format(eval_metrics['entropy'])
+                        string+=' eval_entropy:{},'.format(eval_metrics['entropy'])
+                        string+=' eval_KL:{},'.format( eval_metrics['KL'])
                 log_fn(string)
                 log_fn('-------------------------------------')
 
@@ -650,7 +672,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, output_dir=None,
-        loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}):
+        loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}, ave_loss_memory=[]):
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if mixup_fn is not None:
@@ -661,6 +683,7 @@ def train_one_epoch(
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
     entropy_m = utils.AverageMeter()
+    KL_m = utils.AverageMeter()
 
     model.train()
     
@@ -671,6 +694,8 @@ def train_one_epoch(
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
+    
+    
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
@@ -685,7 +710,7 @@ def train_one_epoch(
         if Li_configs['li_flag']:
             optimizer_Li=Li.optimizer
             train_scheduler_Li=Li.scheduler
-            input_Li, logprob, entropy_every=Li(input)
+            input_Li, logprob, entropy_every, KL_every=Li(input)
                         
             output = model(input_Li)
             loss_predictor = loss_fn(output, target)
@@ -694,11 +719,17 @@ def train_one_epoch(
             if args.Li_loss=='crossentropy':
                 loss_Li=loss_predictor.detach()
             elif args.Li_loss=='accuracy':
-                loss_Li=-output.argmax(axis=-1)==target
+                loss_Li=-(output.argmax(axis=-1)==target).to(torch.float32)
+                        
+            if len(ave_loss_memory)<batch_idx+1:
+                ave_loss_memory.append(loss_Li)
+            else:
+                ave_loss_memory[batch_idx]=ave_loss_memory[batch_idx]*0.8+loss_Li*0.2
             
-            loss_Li_pre=(loss_Li*logprob).mean()+loss_predictor.mean()
+            loss_Li_pre=((loss_Li-ave_loss_memory[batch_idx])*logprob).mean()+loss_predictor.mean()
             entropy=entropy_every.mean(dim=0)
             entropy_m.update(entropy.mean().item(), input.size(0))
+            KL_m.update(KL_every.mean().item(), input.size(0))
             
             if epoch==Li.start_epoch and batch_idx==0:
                 Li.start_entropy=entropy.mean().detach()
@@ -708,7 +739,10 @@ def train_one_epoch(
             r=min(1, (epoch+1-Li.start_epoch)/Li_configs['entropy_increase_period'])
             mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
             
-            loss=loss_Li_pre+(entropy.mean()-mid_target_entropy)**2*args.entropy_parameter#!#!#!#!
+            def get_penalty(value1, value2):
+                sub=value1-value2
+                return torch.abs(sub)*0.3+sub**2
+            loss=loss_Li_pre+get_penalty(entropy.mean(), mid_target_entropy)*args.entropy_parameter#!
             
             optimizer.zero_grad()
             optimizer_Li.zero_grad()
@@ -721,10 +755,12 @@ def train_one_epoch(
                     value=args.clip_grad, mode=args.clip_mode)
             
             if args.device.startswith('tpu'):
-                xm.optimizer_step(optimizer)
+                if not args.train_Li_only:
+                    xm.optimizer_step(optimizer)
                 xm.optimizer_step(optimizer_Li)
             else:
-                optimizer.step()
+                if not args.train_Li_only:
+                    optimizer.step()
                 optimizer_Li.step()
             
         else:        
@@ -752,7 +788,7 @@ def train_one_epoch(
             string='Master: Train: {} [{:>4d}/{} ({:>3.0f}%)], Loss: {loss.val:#.4g} ({loss.avg:#.3g}), Time: {batch_time.val:.3f}s, {rate:>7.2f}/s, ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s), LR: {lr:.3e}, Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                         epoch,
                         batch_idx, len(loader),
-                        100. * batch_idx / last_idx,
+                        100. * batch_idx / (last_idx+1e-3),
                         loss=losses_m,
                         batch_time=batch_time_m,
                         rate=input.size(0) * 1 / batch_time_m.val,
@@ -760,10 +796,11 @@ def train_one_epoch(
                         lr=lr,
                         data_time=data_time_m)
             if Li_configs['li_flag']:
-                string+=', entropy:{}, target_entropy:{}, Li_lr:{}'.format(entropy_m.avg, mid_target_entropy, optimizer_Li.param_groups[0]['lr'])
+                string+=', entropy:{}, target_entropy:{}, Li_lr:{}, KL: {}'.format(entropy_m.avg, mid_target_entropy, optimizer_Li.param_groups[0]['lr'], KL_m.avg)
             
             if not args.device.startswith('tpu') or xm.is_master_ordinal():
                 log_fn(string)
+                pass
 
 
         if lr_scheduler is not None:
@@ -775,7 +812,7 @@ def train_one_epoch(
                 
     metric=[('loss', losses_m.avg)]
     if Li_configs['li_flag']:
-        metric.extend([('entropy', entropy_m.avg)])
+        metric.extend([('entropy', entropy_m.avg), ('KL', KL_m.avg)])
     return OrderedDict(metric)
 
 
@@ -785,6 +822,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     top1_m = utils.AverageMeter()
     top5_m = utils.AverageMeter()
     entropy_m = utils.AverageMeter()
+    KL_m = utils.AverageMeter()
     
     model.eval()
 
@@ -809,10 +847,11 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             
             if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                 n_copies=Li_configs['test_copies']
-                input_Li, logprob, entropy_every=Li(input, n_copies=n_copies)
+                input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
                 #np.save('output/sample/logprob_'+str(batch_idx)+'.npy', logprob.detach().cpu())#@
                 #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
                 entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
+                KL_m.update(KL_every.mean(), KL_every.shape[0])
                 
                 output = model(input_Li) 
                 if isinstance(output, (tuple, list)):
@@ -853,6 +892,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     metric=[('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)]
     if Li_configs['li_flag'] and Li_configs['test_time_aug']:
         metric.extend([('entropy', entropy_m.avg)])
+        metric.extend([('KL', KL_m.avg)])
 
     metrics = OrderedDict(metric)
 

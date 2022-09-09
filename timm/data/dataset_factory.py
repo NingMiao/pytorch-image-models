@@ -17,6 +17,9 @@ except ImportError:
     has_inaturalist = False
 
 from .dataset import IterableImageDataset, ImageDataset
+from torch.utils.data import Dataset
+from torchvision.transforms import ToTensor
+import numpy as np
 
 _TORCH_BASIC_DS = dict(
     cifar10=CIFAR10,
@@ -49,6 +52,22 @@ def _search_split(root, split):
         root = _try(_EVAL_SYNONYM)
     return root
 
+class DebugDataset(Dataset):
+    def __init__(self, dataset, size=256):
+        self.img=[]
+        self.target=[]
+        l=len(dataset)
+        ids=np.random.randint(0, l, [size])
+        for id_ in ids:
+            img, target = dataset[id_]
+            self.img.append(img)
+            self.target.append(target)
+        self.transform=ToTensor()
+    def __len__(self):
+        return len(self.target)
+    def __getitem__(self, idx):
+        return self.transform(self.img[idx]), self.target[idx]
+    
 
 def create_dataset(
         name,
