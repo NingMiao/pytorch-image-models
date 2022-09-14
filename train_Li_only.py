@@ -290,6 +290,8 @@ group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
 group.add_argument('-Li_lr', type=float, default=0.0, help='')
 group.add_argument('-Li_loss', type=str, default='crossentropy', help='[crossentropy, accuracy]')
+group.add_argument('-mode', type=str, default='1', help='[1, 2]')
+group.add_argument('-n_copies', type=int, default=1, help='any int >=1')
 
 
 
@@ -369,6 +371,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     torch.manual_seed(124)
     
     #Initialize model
+    
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -391,6 +394,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         device=args.device
 
     log_fn(f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+    
     
     #Initialize Li net
     if Li_configs['li_flag']:
@@ -415,6 +419,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
       
     
     # optionally resume from a checkpoint
+    
     resume_epoch = None
     if args.resume:
         model.to('cpu')
@@ -422,6 +427,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         model.load_state_dict(saved_dict)
         model.to(device)
         log_fn('resume model finished! Epoch: {}'.format(resume_epoch))
+    
     if args.resume_Li and Li_configs['li_flag']:
         Li.to('cpu')
         saved_dict=torch.load(args.resume_Li)
@@ -430,71 +436,46 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         log_fn('resume Li finished! Epoch: {}'.format(resume_epoch))
 
     #Create optimizer
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
     if Li_configs['li_flag']:
-        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        #optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        optimizer_Li=optim.Adam(Li.parameters())
 
-    # setup learning rate schedule and starting epoch
-    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
-    start_epoch = 0
-    if args.start_epoch is not None:
-        # a specified start_epoch will always override the resume epoch
-        start_epoch = args.start_epoch
-    elif resume_epoch is not None:
-        start_epoch = resume_epoch
-    if lr_scheduler is not None and start_epoch > 0:
-        lr_scheduler.step(start_epoch)
-        pass
 
-    log_fn('Scheduled epochs: {}'.format(num_epochs))
+
     
     if Li_configs['li_flag']:
-        lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
-        if lr_scheduler_Li is not None and start_epoch > 0:
-            lr_scheduler_Li.step(start_epoch)
-            pass
         Li.optimizer=optimizer_Li
-        Li.scheduler=lr_scheduler_Li
         Li.target_entropy=args.target_entropy
-        Li.start_epoch=start_epoch
     
     
-    # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-        repeats=args.epoch_repeats)
-    if args.train_sample_amount>0:
-        dataset_train=DebugDataset(dataset_train, int(args.train_sample_amount))
-
+    # create the datasets
+    import numpy as np
+    np.random.seed(125)
+    #target_np_array=np.load('samples_full/target.npy')
+    input_np_array=np.load('output/samples_full/input.npy').reshape(-1, 3,224,224)#?#!
+    #input_np_array=np.random.random([256, 3,224,224]).astype(np.float32)#?
+    #logit_np_array=np.load('output/samples_full/logit.npy')
+    target_logit=np.load('output/samples_full/target_logit.npy')#?
+    target_logit=target_logit[:, 196:-1]#?
     
-    dataset_eval = create_dataset(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size)
-
-    # setup mixup / cutmix
-    collate_fn = None
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        mixup_args = dict(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.num_classes)
-        mixup_fn = Mixup(**mixup_args)
-
-    # wrap dataset in AugMix helper
-    if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
-
-    # create data loaders w/ augmentation pipeiine
-    train_interpolation = args.train_interpolation
-    if args.no_aug or not train_interpolation:
-        train_interpolation = data_config['interpolation']
+    list_index=np.arange(input_np_array.shape[0])
+    np.random.shuffle(list_index)
+    train_num=40000
+    eval_num=1000
+    train_ids=list_index[:train_num]
+    eval_ids=list_index[train_num:train_num+eval_num]
+    
+    log_fn('train_single_best:{}, eval_single_best:{}'.format(target_logit[train_ids].mean(axis=0).max(), target_logit[eval_ids].mean(axis=0).max()))
+    
+    log_fn('train_best:{}, eval_best:{}'.format(target_logit[train_ids].max(axis=1).mean(), target_logit[eval_ids].max(axis=1).mean()))
+    
+    input_tensor=torch.tensor(input_np_array[train_ids])
+    target_logit_tensor=torch.tensor(target_logit[train_ids])
+    dataset=torch.utils.data.TensorDataset(input_tensor, target_logit_tensor)
+    
+    eval_input_tensor=torch.tensor(input_np_array[eval_ids])
+    eval_target_logit_tensor=torch.tensor(target_logit[eval_ids])
+    eval_dataset=torch.utils.data.TensorDataset(eval_input_tensor, eval_target_logit_tensor)
     
     if args.device.startswith('tpu'):
         num_replicas=args.tpu_core_num
@@ -503,188 +484,62 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         num_replicas=0
         rank=0
     
-    loader_train = create_loader(
-        dataset_train,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        is_training=True,
-        use_prefetcher=False,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        re_split=args.resplit,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        num_aug_repeats=args.aug_repeats,
-        num_aug_splits=num_aug_splits,
-        interpolation=train_interpolation,
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_mem,
-        use_multi_epochs_loader=args.use_multi_epochs_loader,
-        worker_seeding=args.worker_seeding,
-        num_replicas=num_replicas,
-        rank=rank,
-    )
-    
-    
-    loader_eval = create_loader(
-        dataset_eval,
-        input_size=data_config['input_size'],
-        batch_size=args.validation_batch_size or args.batch_size,
-        is_training=False,
-        use_prefetcher=False,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        crop_pct=data_config['crop_pct'],
-        pin_memory=args.pin_mem,
-        num_replicas=num_replicas,
-        rank=rank,
-    )
+    loader =  torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, pin_memory=True)
+    eval_loader =  torch.utils.data.DataLoader(eval_dataset, batch_size=args.batch_size, pin_memory=True)
 
     # setup loss function
-    if args.jsd_loss:
-        assert num_aug_splits > 1  # JSD only valid with aug splits set
-        train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
-    elif mixup_active:
-        # smoothing is handled with mixup target transform which outputs sparse, soft targets
-        if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
-        else:
-            train_loss_fn = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        if args.bce_loss:
-            train_loss_fn = BinaryCrossEntropy(smoothing=args.smoothing, target_threshold=args.bce_target_thresh)
-        else:
-            train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        train_loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss()
     
-    validate_loss_fn = nn.CrossEntropyLoss()
-    if args.device=='cuda':
-        train_loss_fn = train_loss_fn.cuda()
-        validate_loss_fn = validate_loss_fn.cuda()
 
     # setup checkpoint saver and eval metric tracking
-    eval_metric = args.eval_metric
-    best_metric = None
-    best_epoch = None
-    saver = None
-    output_dir = None
-    if True:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
-        decreasing = True if eval_metric == 'loss' else False
-    if args.device in ['cpu', 'cuda'] or xm.is_master_ordinal():
-        with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
-            f.write(args_text)
-
-    try:
-        eval_acc_old=0.0
+    
+    eval_acc_old=0.0
         
-        ave_loss_memory=[]
-        
-        for epoch in range(start_epoch, num_epochs):
-            if not args.eval_only:
+    ave_loss_memory=[]
+    
+    onehot_mat=torch.eye(49, device=device).to(torch.float32)
+    
+    t=time.time()
+    for epoch in range(500):
                 
-                train_metrics = train_one_epoch(
-                    epoch, model, loader_train, optimizer, train_loss_fn, args,
-                    lr_scheduler=lr_scheduler, output_dir=output_dir, loss_scaler=None, mixup_fn=mixup_fn, device=device, Li=Li, Li_configs=Li_configs, ave_loss_memory=ave_loss_memory)
-            else:
-                train_metrics={'loss':0.0, 'entropy':0.0, 'KL':0.0}
-            if not args.train_only:
-                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
-            else:
-                eval_metrics={'loss':0.0, 'entropy':0.0, 'top1':0.0, 'KL':0.0}
-            
-            if lr_scheduler is not None:
-                # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
-                if Li_configs['li_flag']:
-                    lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
-                    
-            
+        metrics = train(epoch, None, loader, loss_fn, args, output_dir=None, mixup_fn=None, device=device, Li=Li, Li_configs=Li_configs, ave_loss_memory=ave_loss_memory, onehot_mat=onehot_mat)
+        
+        if epoch % 1==0:
             if args.device.startswith('tpu'):
-                for key in train_metrics:
-                    train_metrics[key]=xm.mesh_reduce('train'+key, train_metrics[key], reduce_fn)
-                for key in eval_metrics:
-                    eval_metrics[key]=xm.mesh_reduce('eval'+key, eval_metrics[key], reduce_fn)
-                
+                for key in metrics:
+                    metrics[key]=xm.mesh_reduce(key, metrics[key], reduce_fn)
+            metrics['epoch'] = epoch
+            t_now=time.time()
+            metrics['time'] = t_now-t
+            t=t_now
+            log_fn('train  '+str(metrics))
             
-            if output_dir is not None and (not args.device.startswith('tpu') or xm.is_master_ordinal()):
-                utils.update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
-                string='epoch:{}, train_loss:{}, eval_loss:{}, eval_top_1:{},'.format(epoch, train_metrics['loss'], eval_metrics['loss'], eval_metrics['top1'])
-                if Li_configs['li_flag']:
-                    string+=' train_entropy:{},'.format( train_metrics['entropy'])
-                    string+=' train_KL:{},'.format( train_metrics['KL'])
-                    if Li_configs['test_time_aug']:
-                        string+=' eval_entropy:{},'.format(eval_metrics['entropy'])
-                        string+=' eval_KL:{},'.format( eval_metrics['KL'])
-                log_fn(string)
-                log_fn('-------------------------------------')
+            metrics = train(epoch, None, eval_loader, loss_fn, args, output_dir=None, mixup_fn=None, device=device, Li=Li, Li_configs=Li_configs, ave_loss_memory=ave_loss_memory, onehot_mat=onehot_mat, evaluate=True)
+            if args.device.startswith('tpu'):
+                for key in metrics:
+                    metrics[key]=xm.mesh_reduce(key, metrics[key], reduce_fn)
+            metrics['epoch'] = epoch
+            log_fn('eval  '+str(metrics))
+            
+            log_fn('---------------------------------------------------------')
 
-            if eval_metrics['top1']>eval_acc_old or (epoch-start_epoch)%args.save_every==0 or epoch==args.epochs-1:
-                eval_acc_old=eval_metrics['top1']
-                if not args.device.startswith('tpu'):
-                    model.to('cpu')
-                    torch.save(model.state_dict(), os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
-                    model.to(device)
-                    if Li_configs['li_flag']:
-                        Li.to('cpu')
-                        torch.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
-                        Li.to(device)
-                    
-                else:
-                    xm.save(model.state_dict(), os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
-                    if Li_configs['li_flag']:
-                        xm.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
-                    
-                    
-                    
-                    
-    except KeyboardInterrupt:
-        pass
-    if best_metric is not None:
-        log_fn('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
-
-
-        
-
-def train_one_epoch(
-        epoch, model, loader, optimizer, loss_fn, args,
-        lr_scheduler=None, output_dir=None,
-        loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}, ave_loss_memory=[]):
+def train(
+        epoch, model, loader, loss_fn, args, output_dir=None,
+         mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}, ave_loss_memory=[], onehot_mat=None, evaluate=False):
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if mixup_fn is not None:
             mixup_fn.mixup_enabled = False
 
-    second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+    second_order = False
     batch_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
+    
     losses_m = utils.AverageMeter()
+    losses_all_m = utils.AverageMeter()
     entropy_m = utils.AverageMeter()
     KL_m = utils.AverageMeter()
-
-    model.train()
+    acc_m = utils.AverageMeter()
     
     if args.device.startswith('tpu'):
         loader = pl.ParallelLoader(loader, [device])
@@ -694,217 +549,50 @@ def train_one_epoch(
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     
-    for batch_idx, (input, target) in enumerate(loader):
+    for batch_idx, (input, logit) in enumerate(loader):
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
-        if args.device=='cuda':
-            input, target = input.cuda(), target.cuda()
-        if mixup_fn is not None:
-            input, target = mixup_fn(input, target)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        
-        
-        if Li_configs['li_flag']:
+        if True:
             optimizer_Li=Li.optimizer
-            train_scheduler_Li=Li.scheduler
-            input_Li, logprob, entropy_every, KL_every=Li(input)
-                        
-            output = model(input_Li)
-            loss_predictor = loss_fn(output, target)
-            losses_m.update(loss_predictor.item(), input.size(0))
+            _, _, entropy_every, KL_every=Li(input)#?
             
-            if args.Li_loss=='crossentropy':
-                loss_Li=loss_predictor.detach()
-            elif args.Li_loss=='accuracy':
-                loss_Li=-(output.argmax(axis=-1)==target).to(torch.float32)
-                        
-            if len(ave_loss_memory)<batch_idx+1:
-                ave_loss_memory.append(loss_Li)
-            else:
-                ave_loss_memory[batch_idx]=ave_loss_memory[batch_idx]*0.8+loss_Li*0.2
+            logprob=Li.augmentation.distC_crop.logprob
+            prob = torch.exp(logprob)
             
-            loss_Li_pre=((loss_Li-ave_loss_memory[batch_idx])*logprob).mean()+loss_predictor.mean()
+            if args.mode=='1':
+                rand = torch.empty_like(prob).uniform_()
+                samples = (-rand.log()+logprob).topk(k=args.n_copies).indices
+                samples_onehot=torch.index_select(onehot_mat, 0, samples.reshape([-1])).reshape([samples.shape[0], samples.shape[1], -1]).sum(1)
+                
+                loss = -(logit*samples_onehot*logprob).mean()
+                loss_record=-(logit*prob).sum(1).mean()
+                
+            elif args.mode=='2':
+                loss=-(logit*prob).sum(1).mean()
+                loss_record=loss
+            
             entropy=entropy_every.mean(dim=0)
+            loss_all=loss+(-entropy)*0.0
+            
+            losses_m.update(loss_record.item(), input.size(0))
+            losses_all_m.update(loss_all.item(), input.size(0))
             entropy_m.update(entropy.mean().item(), input.size(0))
             KL_m.update(KL_every.mean().item(), input.size(0))
             
-            if epoch==Li.start_epoch and batch_idx==0:
-                Li.start_entropy=entropy.mean().detach()
+            if not evaluate:
+                optimizer_Li.zero_grad()
+            
+                loss_all.backward()
+
                 if args.device.startswith('tpu'):
-                    Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
-            
-            r=min(1, (epoch+1-Li.start_epoch)/Li_configs['entropy_increase_period'])
-            mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
-            
-            def get_penalty(value1, value2):
-                sub=value1-value2
-                return torch.abs(sub)*0.3+sub**2
-            loss=loss_Li_pre+get_penalty(entropy.mean(), mid_target_entropy)*args.entropy_parameter#!
-            
-            optimizer.zero_grad()
-            optimizer_Li.zero_grad()
-            
-            loss.backward()
-            
-            if args.clip_grad is not None:
-                utils.dispatch_clip_grad(
-                    model_parameters(model, exclude_head='agc' in args.clip_mode),
-                    value=args.clip_grad, mode=args.clip_mode)
-            
-            if args.device.startswith('tpu'):
-                if not args.train_Li_only:
-                    xm.optimizer_step(optimizer)
-                xm.optimizer_step(optimizer_Li)
-            else:
-                if not args.train_Li_only:
-                    optimizer.step()
-                optimizer_Li.step()
-            
-        else:        
-            output = model(input)
-            loss = loss_fn(output, target)
-            losses_m.update(loss.item(), input.size(0))
-            optimizer.zero_grad()
-            loss.backward(create_graph=second_order)
-            if args.clip_grad is not None:
-                utils.dispatch_clip_grad(
-                    model_parameters(model, exclude_head='agc' in args.clip_mode),
-                    value=args.clip_grad, mode=args.clip_mode)
+                    xm.optimizer_step(optimizer_Li)
+                else:
+                    optimizer_Li.step()
                 
-            if args.device.startswith('tpu'):
-                xm.optimizer_step(optimizer)
-            else:
-                optimizer.step()
-        
-        num_updates += 1
-        batch_time_m.update(time.time() - end)
-        if last_batch or batch_idx % args.log_interval == 0:
-            lrl = [param_group['lr'] for param_group in optimizer.param_groups]
-            lr = sum(lrl) / len(lrl)
-            
-            string='Master: Train: {} [{:>4d}/{} ({:>3.0f}%)], Loss: {loss.val:#.4g} ({loss.avg:#.3g}), Time: {batch_time.val:.3f}s, {rate:>7.2f}/s, ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s), LR: {lr:.3e}, Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
-                        epoch,
-                        batch_idx, len(loader),
-                        100. * batch_idx / (last_idx+1e-3),
-                        loss=losses_m,
-                        batch_time=batch_time_m,
-                        rate=input.size(0) * 1 / batch_time_m.val,
-                        rate_avg=input.size(0) * 1 / batch_time_m.avg,
-                        lr=lr,
-                        data_time=data_time_m)
-            if Li_configs['li_flag']:
-                string+=', entropy:{}, target_entropy:{}, Li_lr:{}, KL: {}'.format(entropy_m.avg, mid_target_entropy, optimizer_Li.param_groups[0]['lr'], KL_m.avg)
-            
-            if not args.device.startswith('tpu') or xm.is_master_ordinal():
-                log_fn(string)
-                pass
-
-
-        if lr_scheduler is not None:
-            lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
-        if Li_configs['li_flag'] and Li.scheduler is not None:
-            Li.scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
-
-        end = time.time()
-                
-    metric=[('loss', losses_m.avg)]
+    metric=[('loss', losses_m.avg), ('loss_all', losses_all_m.avg)]
     if Li_configs['li_flag']:
         metric.extend([('entropy', entropy_m.avg), ('KL', KL_m.avg)])
     return OrderedDict(metric)
-
-
-def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=print, Li=None, Li_configs={}):
-    batch_time_m = utils.AverageMeter()
-    losses_m = utils.AverageMeter()
-    top1_m = utils.AverageMeter()
-    top5_m = utils.AverageMeter()
-    entropy_m = utils.AverageMeter()
-    KL_m = utils.AverageMeter()
-    
-    model.eval()
-
-    end = time.time()
-    
-    if args.device.startswith('tpu'):
-        loader = pl.ParallelLoader(loader, [device])
-        loader = loader.per_device_loader(device)
-    
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target) in enumerate(loader):
-            
-            #np.save('output/sample/target_'+str(batch_idx)+'.npy', target.detach().cpu())#@
-            #continue#@
-            
-            last_batch = batch_idx == last_idx
-            if args.device=='cuda':
-                input, target = input.cuda(), target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-            
-            
-            if Li_configs['li_flag'] and Li_configs['test_time_aug']:
-                n_copies=Li_configs['test_copies']
-                input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
-                ordinal=xm.get_ordinal()#?
-                #np.save('output/sample/input_'+str(batch_idx)+'_'+str(ordinal)+'.npy', input.detach().cpu())#@
-                #np.save('output/sample/logprob_'+str(batch_idx)+'_'+str(ordinal)+'.npy', logprob.detach().cpu())#@
-                #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
-                entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
-                KL_m.update(KL_every.mean(), KL_every.shape[0])
-                
-                output = model(input_Li) 
-                if isinstance(output, (tuple, list)):
-                    output = output[0]
-                    
-                bs=input.shape[0]
-                logit=F.log_softmax(output, dim=-1)
-                
-                logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
-                np.save('output/sample/logit_'+str(batch_idx)+'_'+str(ordinal)+'.npy', logit.detach().cpu())#?
-                logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
-                #output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
-                print(logit[:5,:10])#?
-                print(hha)#?
-                output=torch.log(torch.sum(torch.exp(logit)*1, dim=1))#?        
-                #print('finish saving!')#@
-                #print(haha)#@
-                
-            else:
-                output = model(input)
-                if isinstance(output, (tuple, list)):
-                    output = output[0]
-
-                # augmentation reduction
-                reduce_factor = args.tta
-                if reduce_factor > 1:
-                    output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                    target = target[0:target.size(0):reduce_factor]
-
-            loss = loss_fn(output, target)
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-            print(output[:5,:10])
-            print(acc1)#?
-            print(haha)#?
-            
-            reduced_loss = loss.data
-
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            
-    metric=[('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)]
-    if Li_configs['li_flag'] and Li_configs['test_time_aug']:
-        metric.extend([('entropy', entropy_m.avg)])
-        metric.extend([('KL', KL_m.avg)])
-
-    metrics = OrderedDict(metric)
-
-    return metrics
 
 
 if __name__ == '__main__':
