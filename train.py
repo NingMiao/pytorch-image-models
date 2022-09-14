@@ -290,7 +290,8 @@ group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
 group.add_argument('-Li_lr', type=float, default=0.0, help='')
 group.add_argument('-Li_loss', type=str, default='crossentropy', help='[crossentropy, accuracy]')
-
+group.add_argument('-Li_optimizer', type=str, default='sgd', help='[sgd, adam]')
+group.add_argument('-no_Li_scheduler', action='store_true', default=False)
 
 
 group.add_argument('-eval_only', action='store_true', default=False,
@@ -328,6 +329,11 @@ def _parse_args():
         
     else:
         Li_configs={'li_flag': False}
+    
+    if args.no_Li_scheduler:
+        args.Li_scheduler=False
+    else:
+        args.Li_scheduler=True
     
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -432,7 +438,10 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     #Create optimizer
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
     if Li_configs['li_flag']:
-        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        if args.Li_optimizer=='sgd':
+            optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        else:
+            optimizer_Li=optim.Adam(Li.parameters())
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -449,7 +458,11 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     log_fn('Scheduled epochs: {}'.format(num_epochs))
     
     if Li_configs['li_flag']:
-        lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
+        if args.Li_scheduler:
+            lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
+        else:
+            lr_scheduler_Li=None
+    
         if lr_scheduler_Li is not None and start_epoch > 0:
             lr_scheduler_Li.step(start_epoch)
             pass
@@ -674,6 +687,7 @@ def train_one_epoch(
         lr_scheduler=None, output_dir=None,
         loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}, ave_loss_memory=[]):
 
+    
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if mixup_fn is not None:
             mixup_fn.mixup_enabled = False
@@ -737,11 +751,11 @@ def train_one_epoch(
                     Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
             
             r=min(1, (epoch+1-Li.start_epoch)/Li_configs['entropy_increase_period'])
-            mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
+            mid_target_entropy=Li.target_entropy
             
             def get_penalty(value1, value2):
-                sub=value1-value2
-                return torch.abs(sub)*0.3+sub**2
+                sub=torch.abs(value2-value1)
+                return sub**2
             loss=loss_Li_pre+get_penalty(entropy.mean(), mid_target_entropy)*args.entropy_parameter#!
             
             optimizer.zero_grad()
