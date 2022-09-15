@@ -629,7 +629,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
                 pass
-                if Li_configs['li_flag']:
+                if Li_configs['li_flag'] and lr_scheduler_Li is not None:
                     lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
                     pass
                     
