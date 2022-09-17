@@ -195,6 +195,7 @@ def create_loader(
         worker_seeding='all',
         num_replicas=0,
         rank=0,
+        tta=False,
 ):
     re_num_splits = 0
     if re_split:
@@ -221,6 +222,7 @@ def create_loader(
         re_count=re_count,
         re_num_splits=re_num_splits,
         separate=num_aug_splits > 0,
+        tta=tta,
     )
 
     sampler = None

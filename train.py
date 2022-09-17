@@ -548,7 +548,15 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         pin_memory=args.pin_mem,
         num_replicas=num_replicas,
         rank=rank,
+        tta=(args.tta>0),
+        scale=args.scale,
+        ratio=args.ratio,
+        hflip=args.hflip,
+        vflip=args.vflip,
+        color_jitter=args.color_jitter,
+        auto_augment=args.aa,
     )
+
 
     # setup loss function
     if args.jsd_loss:
@@ -828,55 +836,91 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
 
     end = time.time()
     
-    if args.device.startswith('tpu'):
-        loader = pl.ParallelLoader(loader, [device])
-        loader = loader.per_device_loader(device)
     
     last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target) in enumerate(loader):
+    
+    if args.tta==0:
+        #args.tta not include Li tta
+        with torch.no_grad():
+            if args.device.startswith('tpu'):
+                loader = pl.ParallelLoader(loader, [device])
+                loader = loader.per_device_loader(device)
+            for batch_idx, (input, target) in enumerate(loader):
             
-            #np.save('output/sample/target_'+str(batch_idx)+'.npy', target.detach().cpu())#@
+                #np.save('output/sample/target_'+str(batch_idx)+'.npy', target.detach().cpu())#@
             
-            last_batch = batch_idx == last_idx
-            if args.device=='cuda':
-                input, target = input.cuda(), target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
+                last_batch = batch_idx == last_idx
+                if args.device=='cuda':
+                    input, target = input.cuda(), target.cuda()
+                if args.channels_last:
+                    input = input.contiguous(memory_format=torch.channels_last)
             
             
-            if Li_configs['li_flag'] and Li_configs['test_time_aug']:
-                n_copies=Li_configs['test_copies']
-                input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
-                #np.save('output/sample/logprob_'+str(batch_idx)+'.npy', logprob.detach().cpu())#@
-                #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
-                entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
-                KL_m.update(KL_every.mean(), KL_every.shape[0])
+                if Li_configs['li_flag'] and Li_configs['test_time_aug']:
+                    n_copies=Li_configs['test_copies']
+                    input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
+                    #np.save('output/sample/logprob_'+str(batch_idx)+'.npy', logprob.detach().cpu())#@
+                    #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
+                    entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
+                    KL_m.update(KL_every.mean(), KL_every.shape[0])
                 
-                output = model(input_Li) 
-                if isinstance(output, (tuple, list)):
-                    output = output[0]
+                    output = model(input_Li) 
+                    if isinstance(output, (tuple, list)):
+                        output = output[0]
                     
-                bs=input.shape[0]
-                logit=F.log_softmax(output, dim=-1)
-                logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
-                #np.save('output/sample/logit_'+str(batch_idx)+'.npy', logit.detach().cpu())#@
-                logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
-                output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
-                #print('finish saving!')#@
-                #print(haha)#@
+                    bs=input.shape[0]
+                    logit=F.log_softmax(output, dim=-1)
+                    logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
+                    #np.save('output/sample/logit_'+str(batch_idx)+'.npy', logit.detach().cpu())#@
+                    logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
+                    output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
+                    #print('finish saving!')#@
+                    #print(haha)#@
                 
-            else:
-                output = model(input)
-                if isinstance(output, (tuple, list)):
-                    output = output[0]
-
+                else:
+                    output = model(input)
+                    if isinstance(output, (tuple, list)):
+                        output = output[0]
+                
                 # augmentation reduction
-                reduce_factor = args.tta
-                if reduce_factor > 1:
-                    output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                    target = target[0:target.size(0):reduce_factor]
+                    reduce_factor = args.tta
+                    if reduce_factor > 1:
+                        output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
+                        target = target[0:target.size(0):reduce_factor]
 
+                loss = loss_fn(output, target)
+                acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+
+                reduced_loss = loss.data
+
+                losses_m.update(reduced_loss.item(), input.size(0))
+                top1_m.update(acc1.item(), output.size(0))
+                top5_m.update(acc5.item(), output.size(0))
+
+                batch_time_m.update(time.time() - end)
+                end = time.time()
+            
+    else:
+        output_list_list=[]
+        target_list=[]
+        for epoch in range(args.tta):
+            with torch.no_grad():
+                if args.device.startswith('tpu'):
+                    loader = pl.ParallelLoader(loader, [device])
+                    loader = loader.per_device_loader(device)
+                output_list=[]
+                for batch_idx, (input, target) in enumerate(loader):
+                    output = model(input)
+                    if isinstance(output, (tuple, list)):
+                        output = output[0]
+                    output_list.append(output)
+                    if epoch==0:
+                        target_list.append(target)
+                output_list_list.append(output_list)
+        
+        for batch_idx in range(len(target)):
+            output=torch.mean(torch.stack([output_list[batch_idx] for output_list in output_list_list], dim=1), dim=1)
+            target = target_list[batch_idx]
             loss = loss_fn(output, target)
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
 
@@ -885,9 +929,6 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
             top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
             
     metric=[('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)]
     if Li_configs['li_flag'] and Li_configs['test_time_aug']:
