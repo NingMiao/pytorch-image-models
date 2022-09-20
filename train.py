@@ -41,6 +41,7 @@ from timm.utils import ApexScaler, NativeScaler
 
 import numpy as np
 
+
 torch.backends.cudnn.benchmark = True
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -290,7 +291,9 @@ group.add_argument('-entropy_weights', type=float, default=0.0, help='')
 group.add_argument('-entropy_parameter', type=float, default=0.3, help='')
 group.add_argument('-Li_lr', type=float, default=0.0, help='')
 group.add_argument('-Li_loss', type=str, default='crossentropy', help='[crossentropy, accuracy]')
-
+group.add_argument('-Li_optimizer', type=str, default='sgd', help='[sgd, adam]')
+group.add_argument('-no_Li_scheduler', action='store_true', default=False)
+group.add_argument('-vrm', type=str, default='sample', help='variance reduction mode: [none, sample, global]')
 
 
 group.add_argument('-eval_only', action='store_true', default=False,
@@ -328,6 +331,11 @@ def _parse_args():
         
     else:
         Li_configs={'li_flag': False}
+    
+    if args.no_Li_scheduler:
+        args.Li_scheduler=False
+    else:
+        args.Li_scheduler=True
     
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
@@ -425,14 +433,20 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     if args.resume_Li and Li_configs['li_flag']:
         Li.to('cpu')
         saved_dict=torch.load(args.resume_Li)
-        Li.augmentation.get_param.conv.load_state_dict(saved_dict)
+        if hasattr(Li.augmentation.get_param, 'conv'):
+            Li.augmentation.get_param.conv.load_state_dict(saved_dict)
+        else:
+            Li.augmentation.get_param.load_state_dict(saved_dict)
         Li.to(device)
         log_fn('resume Li finished! Epoch: {}'.format(resume_epoch))
 
     #Create optimizer
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
     if Li_configs['li_flag']:
-        optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        if args.Li_optimizer=='sgd':
+            optimizer_Li=optim.SGD(Li.parameters(), lr=Li_configs['lr'])
+        else:
+            optimizer_Li=optim.Adam(Li.parameters())
 
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
@@ -449,7 +463,11 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     log_fn('Scheduled epochs: {}'.format(num_epochs))
     
     if Li_configs['li_flag']:
-        lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
+        if args.Li_scheduler:
+            lr_scheduler_Li, _ = create_scheduler(args, optimizer_Li)
+        else:
+            lr_scheduler_Li=None
+    
         if lr_scheduler_Li is not None and start_epoch > 0:
             lr_scheduler_Li.step(start_epoch)
             pass
@@ -624,7 +642,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
                 pass
-                if Li_configs['li_flag']:
+                if Li_configs['li_flag'] and lr_scheduler_Li is not None:
                     lr_scheduler_Li.step(epoch + 1, eval_metrics[eval_metric])
                     pass
                     
@@ -664,7 +682,10 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
                 else:
                     xm.save(model.state_dict(), os.path.join(output_dir, 'model'+str(epoch)+'.ckpt'))
                     if Li_configs['li_flag']:
-                        xm.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
+                        if hasattr(Li.augmentation.get_param, 'conv'):
+                            xm.save(Li.augmentation.get_param.conv.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
+                        else:
+                            xm.save(Li.augmentation.get_param.state_dict(), os.path.join(output_dir, 'Li'+str(epoch)+'.ckpt'))
                     
                     
                     
@@ -682,6 +703,7 @@ def train_one_epoch(
         lr_scheduler=None, output_dir=None,
         loss_scaler=None, mixup_fn=None, device=None, log_fn=print, Li=None, Li_configs={}, ave_loss_memory=[]):
 
+    
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if mixup_fn is not None:
             mixup_fn.mixup_enabled = False
@@ -719,7 +741,11 @@ def train_one_epoch(
             optimizer_Li=Li.optimizer
             train_scheduler_Li=Li.scheduler
             input_Li, logprob, entropy_every, KL_every=Li(input)
-                        
+            if False:
+                np.save('output/sample/input'+'.npy', input.detach().cpu())#@
+                np.save('output/sample/input_Li'+'.npy', input_Li.detach().cpu())#@
+                print(torch.abs(input_Li-input).mean())   
+            
             output = model(input_Li)
             loss_predictor = loss_fn(output, target)
             losses_m.update(loss_predictor.item(), input.size(0))
@@ -728,13 +754,23 @@ def train_one_epoch(
                 loss_Li=loss_predictor.detach()
             elif args.Li_loss=='accuracy':
                 loss_Li=-(output.argmax(axis=-1)==target).to(torch.float32)
-                        
-            if len(ave_loss_memory)<batch_idx+1:
-                ave_loss_memory.append(loss_Li)
-            else:
-                ave_loss_memory[batch_idx]=ave_loss_memory[batch_idx]*0.8+loss_Li*0.2
             
-            loss_Li_pre=((loss_Li-ave_loss_memory[batch_idx])*logprob).mean()+loss_predictor.mean()
+            if args.vrm=='sample':
+                if len(ave_loss_memory)<batch_idx+1:
+                    ave_loss_memory.append(loss_Li)
+                else:
+                    ave_loss_memory[batch_idx]=ave_loss_memory[batch_idx]*0.8+loss_Li*0.2
+                ave_loss_current=ave_loss_memory[batch_idx]
+            elif args.vrm=='global':
+                if len(ave_loss_memory)==0:
+                    ave_loss_memory.append(loss_Li.mean())
+                else:
+                    ave_loss_memory[0]=ave_loss_memory[0]*0.9+loss_Li.mean()*0.1
+                ave_loss_current=ave_loss_memory[0]
+            else:
+                ave_loss_current=0.0
+            
+            loss_Li_pre=((loss_Li-ave_loss_current)*logprob).mean()+loss_predictor.mean()
             entropy=entropy_every.mean(dim=0)
             entropy_m.update(entropy.mean().item(), input.size(0))
             KL_m.update(KL_every.mean().item(), input.size(0))
@@ -745,11 +781,11 @@ def train_one_epoch(
                     Li.start_entropy=xm.mesh_reduce('start_entropy', Li.start_entropy, reduce_fn)
             
             r=min(1, (epoch+1-Li.start_epoch)/Li_configs['entropy_increase_period'])
-            mid_target_entropy=Li.target_entropy*r+Li.start_entropy*(1-r)
+            mid_target_entropy=Li.target_entropy
             
             def get_penalty(value1, value2):
-                sub=value1-value2
-                return torch.abs(sub)*0.3+sub**2
+                sub=torch.abs(value2-value1)
+                return sub**2
             loss=loss_Li_pre+get_penalty(entropy.mean(), mid_target_entropy)*args.entropy_parameter#!
             
             optimizer.zero_grad()
@@ -805,10 +841,9 @@ def train_one_epoch(
                         data_time=data_time_m)
             if Li_configs['li_flag']:
                 string+=', entropy:{}, target_entropy:{}, Li_lr:{}, KL: {}'.format(entropy_m.avg, mid_target_entropy, optimizer_Li.param_groups[0]['lr'], KL_m.avg)
-            
+                string+=', bias:{}'.format(str(Li.augmentation.get_param.Adjust_bias()*5))
             if not args.device.startswith('tpu') or xm.is_master_ordinal():
                 log_fn(string)
-                pass
 
 
         if lr_scheduler is not None:
