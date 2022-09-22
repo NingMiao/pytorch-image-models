@@ -42,6 +42,7 @@ from timm.utils import ApexScaler, NativeScaler
 import numpy as np
 
 
+
 torch.backends.cudnn.benchmark = True
 
 # The first arg parser parses out only the --config argument, this argument is used to
@@ -744,7 +745,6 @@ def train_one_epoch(
             if False:
                 np.save('output/sample/input'+'.npy', input.detach().cpu())#@
                 np.save('output/sample/input_Li'+'.npy', input_Li.detach().cpu())#@
-                print(torch.abs(input_Li-input).mean())   
             
             output = model(input_Li)
             loss_predictor = loss_fn(output, target)
@@ -874,6 +874,8 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     
     last_idx = len(loader) - 1
     
+    #device_id=xm.get_ordinal()#@
+    
     if args.tta==0:
         #args.tta not include Li tta
         with torch.no_grad():
@@ -881,8 +883,10 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 loader = pl.ParallelLoader(loader, [device])
                 loader = loader.per_device_loader(device)
             for batch_idx, (input, target) in enumerate(loader):
-            
-                #np.save('output/sample/target_'+str(batch_idx)+'.npy', target.detach().cpu())#@
+                
+                #if batch_idx%50==0:#@
+                #    log_fn(batch_idx)
+                #np.save('output/sample/target_'+str(batch_idx)+'_'+str(device_id)+'.npy', target.detach().cpu())#@
             
                 last_batch = batch_idx == last_idx
                 if args.device=='cuda':
@@ -894,7 +898,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                     n_copies=Li_configs['test_copies']
                     input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
-                    #np.save('output/sample/logprob_'+str(batch_idx)+'.npy', logprob.detach().cpu())#@
+                    #np.save('output/sample/logprob_'+str(batch_idx)+'_'+str(device_id)+'.npy', logprob.detach().cpu())#@
                     #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
                     entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
                     KL_m.update(KL_every.mean(), KL_every.shape[0])
@@ -906,7 +910,7 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                     bs=input.shape[0]
                     logit=F.log_softmax(output, dim=-1)
                     logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
-                    #np.save('output/sample/logit_'+str(batch_idx)+'.npy', logit.detach().cpu())#@
+                    #np.save('output/sample/logit_'+str(batch_idx)+'_'+str(device_id)+'.npy', logit.detach().cpu())#@
                     logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
                     output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
                     #print('finish saving!')#@
