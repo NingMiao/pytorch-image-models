@@ -68,8 +68,14 @@ def transforms_imagenet_train(
     """
     scale = tuple(scale or (0.08, 1.0))  # default imagenet scale range
     ratio = tuple(ratio or (3./4., 4./3.))  # default imagenet ratio range
+    #primary_tfl = [
+    #    RandomResizedCropAndInterpolation(img_size, scale=scale, ratio=ratio, interpolation=interpolation)]
     primary_tfl = [
-        RandomResizedCropAndInterpolation(img_size, scale=scale, ratio=ratio, interpolation=interpolation)]
+       transforms.Resize(img_size, interpolation=str_to_interp_mode(interpolation)),
+       transforms.CenterCrop(img_size),
+       transforms.RandomResizedCrop(img_size, scale=scale, ratio=ratio, interpolation=str_to_interp_mode(interpolation)),
+    ]
+    
     if hflip > 0.:
         primary_tfl += [transforms.RandomHorizontalFlip(p=hflip)]
     if vflip > 0.:
