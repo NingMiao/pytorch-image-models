@@ -1,7 +1,7 @@
 #Baseline
 #python3 train.py /mnt/ssd/imagenet/ --model resnet50 --device tpu-8 --experiment resnet-50-no_aug_from_scratch --batch-size 512 --epochs 90 --lr 0.2 --warmup-epoch 0 --cooldown-epochs 0 --sched step --no-aug
 
-python3 train.py /mnt/ssd/imagenet/ --model resnet50 --device cpu --experiment resnet-50-random_crop_from_scratch_new_transformation --batch-size 512 --epochs 90 --lr 0.2 --warmup-epoch 0 --cooldown-epochs 0 --sched step --decay-epochs 30 -save_every 5 --color-jitter 0.0
+python3 train.py /mnt/ssd/imagenet/ --model resnet50 --device tpu-8 --experiment resnet-50-random_crop_from_scratch_new_transformation_random_crop --batch-size 512 --epochs 90 --lr 0.2 --warmup-epoch 0 --cooldown-epochs 0 --sched step --decay-epochs 30 -save_every 5 --color-jitter 0.0
 
 #python3 train.py /mnt/ssd/imagenet/ --model resnet50 --device tpu-8 --experiment resnet-50-aa_from_scratch --batch-size 512 --epochs 90 --lr 0.2 --warmup-epoch 0 --cooldown-epochs 0 --sched step --aa original --decay-epochs 30
 

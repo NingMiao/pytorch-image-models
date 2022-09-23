@@ -70,11 +70,18 @@ def transforms_imagenet_train(
     ratio = tuple(ratio or (3./4., 4./3.))  # default imagenet ratio range
     #primary_tfl = [
     #    RandomResizedCropAndInterpolation(img_size, scale=scale, ratio=ratio, interpolation=interpolation)]
+    #primary_tfl = [
+    #   transforms.Resize(img_size, interpolation=str_to_interp_mode(interpolation)),
+    #   transforms.CenterCrop(img_size),
+    #   transforms.RandomResizedCrop(img_size, scale=scale, ratio=ratio, interpolation=str_to_interp_mode(interpolation)),
+    #]
+    img_size_last=img_size[-1]
     primary_tfl = [
-       transforms.Resize(img_size, interpolation=str_to_interp_mode(interpolation)),
-       transforms.CenterCrop(img_size),
-       transforms.RandomResizedCrop(img_size, scale=scale, ratio=ratio, interpolation=str_to_interp_mode(interpolation)),
+       transforms.Resize(img_size_last, interpolation=str_to_interp_mode(interpolation)),
+       transforms.RandomCrop(img_size_last),
+       transforms.RandomResizedCrop(img_size_last, scale=scale, ratio=ratio, interpolation=str_to_interp_mode(interpolation)),
     ]
+    
     
     if hflip > 0.:
         primary_tfl += [transforms.RandomHorizontalFlip(p=hflip)]
