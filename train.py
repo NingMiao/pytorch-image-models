@@ -583,7 +583,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
     )
     
     if args.eval_on_train:
-        loader_eval=loader_train#?
+        loader_eval=loader_train
 
     # setup loss function
     if args.jsd_loss:
@@ -955,8 +955,6 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
 
                 batch_time_m.update(time.time() - end)
                 end = time.time()
-                if batch_idx>100:#?
-                    break#?
             
     else:
         output_list_list=[]
