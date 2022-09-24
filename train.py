@@ -307,6 +307,12 @@ group.add_argument('-batch_amount', type=int, default=0,
                     help='for debug') 
 group.add_argument('-train_only', action='store_true', default=False,
                     help='') 
+group.add_argument('-eval_on_train', action='store_true', default=False,
+                    help='') 
+group.add_argument('-eval_max_batch', type=int, default=0,
+                    help='for debug') 
+group.add_argument('-sample_save', type=str, default='',
+                    help='do not forget to turn on tta on Li config file') 
                    
 def _parse_args():
     # Do we have a config file to parse?
@@ -575,7 +581,9 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
         color_jitter=args.color_jitter,
         auto_augment=args.aa,
     )
-
+    
+    if args.eval_on_train:
+        loader_eval=loader_train#?
 
     # setup loss function
     if args.jsd_loss:
@@ -635,7 +643,7 @@ def run_wrapper(_, args, args_text, log_fn, Li_configs):
             else:
                 train_metrics={'loss':0.0, 'entropy':0.0, 'KL':0.0}
             if not args.train_only:
-                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs)
+                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, device=device, Li=Li, Li_configs=Li_configs, log_fn=log_fn)
             else:
                 eval_metrics={'loss':0.0, 'entropy':0.0, 'top1':0.0, 'KL':0.0}
             
@@ -874,7 +882,10 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
     
     last_idx = len(loader) - 1
     
-    #device_id=xm.get_ordinal()#@
+    try:
+        device_id=xm.get_ordinal()#@
+    except:
+        device_id=0
     
     if args.tta==0:
         #args.tta not include Li tta
@@ -884,9 +895,13 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 loader = loader.per_device_loader(device)
             for batch_idx, (input, target) in enumerate(loader):
                 
-                #if batch_idx%50==0:#@
-                #    log_fn(batch_idx)
-                #np.save('output/sample/target_'+str(batch_idx)+'_'+str(device_id)+'.npy', target.detach().cpu())#@
+                if batch_idx%50==0:#@
+                    log_fn(batch_idx)
+                if args.eval_max_batch>0 and batch_idx>args.eval_max_batch:
+                    break
+                    
+                if args.sample_save:
+                    np.save(args.sample_save+'target_'+str(batch_idx)+'_'+str(device_id)+'.npy', target.detach().cpu())#@
             
                 last_batch = batch_idx == last_idx
                 if args.device=='cuda':
@@ -894,11 +909,11 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                 if args.channels_last:
                     input = input.contiguous(memory_format=torch.channels_last)
             
-            
                 if Li_configs['li_flag'] and Li_configs['test_time_aug']:
                     n_copies=Li_configs['test_copies']
                     input_Li, logprob, entropy_every, KL_every=Li(input, n_copies=n_copies)
-                    #np.save('output/sample/logprob_'+str(batch_idx)+'_'+str(device_id)+'.npy', logprob.detach().cpu())#@
+                    if args.sample_save:
+                        np.save(args.sample_save+'logprob_'+str(batch_idx)+'_'+str(device_id)+'.npy', logprob.detach().cpu())#@
                     #np.save('output/entropy_every.npy', entropy_every.detach().cpu())#@
                     entropy_m.update(entropy_every.mean(), entropy_every.shape[0])
                     KL_m.update(KL_every.mean(), KL_every.shape[0])
@@ -909,8 +924,10 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
                     
                     bs=input.shape[0]
                     logit=F.log_softmax(output, dim=-1)
+                    
                     logit=logit.reshape([n_copies, bs, -1]).transpose(0,1)
-                    #np.save('output/sample/logit_'+str(batch_idx)+'_'+str(device_id)+'.npy', logit.detach().cpu())#@
+                    if args.sample_save:
+                        np.save(args.sample_save+'logit_'+str(batch_idx)+'_'+str(device_id)+'.npy', logit.detach().cpu())#@
                     logprob_new=logprob.reshape([n_copies, bs]).transpose(0,1).unsqueeze(-1)
                     output=torch.log(torch.sum(torch.exp(logit)*torch.exp(logprob_new*0.5), dim=1))        
                     #print('finish saving!')#@
@@ -938,6 +955,8 @@ def validate(model, loader, loss_fn, args, log_suffix='', device=None, log_fn=pr
 
                 batch_time_m.update(time.time() - end)
                 end = time.time()
+                if batch_idx>100:#?
+                    break#?
             
     else:
         output_list_list=[]
